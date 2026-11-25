@@ -1,19 +1,20 @@
 """Task 4: Integrated serving pipeline with stress tests and benchmarks.
 
-Components:
-- Client threads
-- Router
-- Thread-safe LRU cache (coarse/scoped)
-- DynamicBatchQueue
-- Inference worker pool
+Pipeline:
+  Client Threads -> Router -> Thread-Safe LRU Cache (embeddings) -> DynamicBatchQueue -> Inference Worker Pool
+
+ML:
+  - train_model.py trains and saves a tiny embedding classifier (artifacts/).
+  - This script loads the saved model; it does NOT retrain.
+  - Embedding computation and batched forward pass use real tinygrad inference.
 
 Lock hierarchy:
 1. Router stats lock (router._stats_lock) - short-lived counters only
-2. Cache lock (inside LRUEmbeddingCache) - never held during embed/forward
+2. Cache lock (inside LRUEmbeddingCache) - never held during model inference
 3. Queue condition lock (inside DynamicBatchQueue)
+4. Model inference lock (pipeline._model_lock) - serializes tinygrad calls; never held with cache/queue locks
 
-The router does not hold cache and queue locks simultaneously. Cache and queue locks
-are disjoint in scope. This prevents deadlocks.
+Cache and queue locks are disjoint. Model lock is taken only around tinygrad compute/forward.
 """
 from __future__ import annotations
 
@@ -23,9 +24,14 @@ import random
 import statistics
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import numpy as np
+from tinygrad import Tensor
+
+from ml_model import LoadedModel, embed_prompt, load_model, MAX_LEN, tokenize
 from task2_lru_cache import LRUEmbeddingCache
 from task3_batch_queue import DynamicBatchQueue, ShutdownError
 
@@ -34,22 +40,26 @@ from task3_batch_queue import DynamicBatchQueue, ShutdownError
 class Request:
     request_id: int
     prompt: str
+    embedding: np.ndarray | None
     submitted_at: float
     done: threading.Event
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    terminal: bool = False  # first terminal state wins
     result: Any = None
     error: str | None = None
     completed_at: float | None = None
 
 
 class InferenceWorkerPool:
-    def __init__(self, queue: DynamicBatchQueue[Request], num_workers: int, max_batch_size: int, batch_timeout_s: float, process_delay_s: float = 0.005):
+    def __init__(self, queue: DynamicBatchQueue[Request], model: LoadedModel, num_workers: int, max_batch_size: int, batch_timeout_s: float, model_lock: threading.Lock):
         self.queue = queue
+        self.model = model.model
+        self.meta = model.meta
         self.num_workers = num_workers
         self.max_batch_size = max_batch_size
         self.batch_timeout_s = batch_timeout_s
-        self.process_delay_s = process_delay_s
+        self.model_lock = model_lock
         self._threads: list[threading.Thread] = []
-        self._stop = threading.Event()
         self._stats_lock = threading.Lock()
         self.batches_processed = 0
         self.total_batch_items = 0
@@ -68,17 +78,34 @@ class InferenceWorkerPool:
                 if self.queue.is_shutdown() and self.queue.qsize() == 0:
                     return
                 continue
-            # Simulate batched forward pass outside any lock.
-            time.sleep(self.process_delay_s)
+            try:
+                embs = np.stack([r.embedding for r in batch if r.embedding is not None], axis=0).astype(np.float32)
+                with self.model_lock:
+                    logits = self.model.logits_from_embedding(Tensor(embs)).realize().numpy()
+                preds = logits.argmax(axis=-1)
+                now = time.perf_counter()
+                for req, pred in zip(batch, preds.tolist()):
+                    with req.lock:
+                        if req.terminal:
+                            continue
+                        req.terminal = True
+                        req.result = {"pred": int(pred), "prompt": req.prompt}
+                        req.completed_at = now
+                        req.done.set()
+            except Exception as e:
+                now = time.perf_counter()
+                for req in batch:
+                    with req.lock:
+                        if req.terminal:
+                            continue
+                        req.terminal = True
+                        req.error = repr(e)
+                        req.completed_at = now
+                        req.done.set()
             with self._stats_lock:
                 self.batches_processed += 1
                 self.total_batch_items += len(batch)
                 self.total_forward_calls += 1
-            now = time.perf_counter()
-            for req in batch:
-                req.result = f"out:{req.prompt}"
-                req.completed_at = now
-                req.done.set()
 
     def join(self, timeout: float | None = None) -> None:
         for t in self._threads:
@@ -98,10 +125,11 @@ class InferenceWorkerPool:
 
 
 class Router:
-    def __init__(self, cache: LRUEmbeddingCache, queue: DynamicBatchQueue[Request], embed_delay_s: float = 0.002):
+    def __init__(self, cache: LRUEmbeddingCache, queue: DynamicBatchQueue[Request], model: LoadedModel, model_lock: threading.Lock):
         self.cache = cache
         self.queue = queue
-        self.embed_delay_s = embed_delay_s
+        self.model = model.model
+        self.model_lock = model_lock
         self._stats_lock = threading.Lock()
         self.total_requests = 0
         self.accepted = 0
@@ -110,44 +138,61 @@ class Router:
         self.errors = 0
         self.latencies_s: list[float] = []
 
-    def _embed(self, prompt: str) -> str:
-        time.sleep(self.embed_delay_s)
-        return f"emb:{prompt}"
+    def _embed(self, prompt: str) -> np.ndarray:
+        # Real tinygrad embedding computation.
+        with self.model_lock:
+            return embed_prompt(self.model, prompt)
 
     def handle(self, req: Request) -> None:
         with self._stats_lock:
             self.total_requests += 1
-            self.accepted += 1  # accepted by router; terminal outcome tracked below
+            self.accepted += 1
+        terminal = None  # "completed" | "rejected"
+        latency = None
+        err = False
         try:
-            # Cache lookup/compute - scoped mode releases lock during embed.
-            self.cache.get_or_compute(req.prompt, lambda p=req.prompt: self._embed(p))
+            emb, _hit = self.cache.get_or_compute(req.prompt, lambda p=req.prompt: self._embed(p))
+            req.embedding = emb
             self.queue.put(req)
-            # Wait for worker completion
-            ok = req.done.wait(timeout=10.0)
-            if not ok:
-                req.error = "timeout"
-                req.done.set()
-                with self._stats_lock:
-                    self.errors += 1
-                    self.completed += 1  # terminal
-                return
-            with self._stats_lock:
-                self.completed += 1
-                if req.error:
-                    self.errors += 1
-                elif req.completed_at is not None:
-                    self.latencies_s.append(req.completed_at - req.submitted_at)
+            ok = req.done.wait(timeout=30.0)
+            with req.lock:
+                if not ok and not req.terminal:
+                    req.terminal = True
+                    req.error = "timeout"
+                    req.completed_at = time.perf_counter()
+                    req.done.set()
+                # Read terminal state under lock
+                err = req.error is not None
+                latency = (req.completed_at - req.submitted_at) if (req.completed_at is not None and not req.error) else None
+                terminal = "rejected" if req.error == "rejected_on_shutdown" else "completed"
         except ShutdownError:
-            req.error = "rejected_on_shutdown"
-            req.done.set()
-            with self._stats_lock:
-                self.rejected_on_shutdown += 1
+            with req.lock:
+                if not req.terminal:
+                    req.terminal = True
+                    req.error = "rejected_on_shutdown"
+                    req.completed_at = time.perf_counter()
+                    req.done.set()
+            terminal = "rejected"
+            err = False
         except Exception as e:
-            req.error = repr(e)
-            req.done.set()
-            with self._stats_lock:
-                self.errors += 1
-                self.completed += 1  # terminal error after acceptance
+            with req.lock:
+                if not req.terminal:
+                    req.terminal = True
+                    req.error = repr(e)
+                    req.completed_at = time.perf_counter()
+                    req.done.set()
+            terminal = "completed"
+            err = True
+
+        with self._stats_lock:
+            if terminal == "rejected":
+                self.rejected_on_shutdown += 1
+            else:
+                self.completed += 1
+                if err:
+                    self.errors += 1
+                elif latency is not None:
+                    self.latencies_s.append(latency)
 
     def snapshot(self) -> dict[str, Any]:
         with self._stats_lock:
@@ -170,8 +215,16 @@ class Router:
             }
 
 
+def load_saved_model() -> LoadedModel:
+    loaded = load_model()
+    # Sanity inference to ensure weights loaded.
+    _ = embed_prompt(loaded.model, "warmup prompt")
+    return loaded
+
+
 def run_pipeline(
     *,
+    model: LoadedModel,
     num_clients: int = 30,
     requests_per_client: int = 20,
     cache_capacity: int = 32,
@@ -180,29 +233,26 @@ def run_pipeline(
     num_workers: int = 4,
     max_batch_size: int = 8,
     batch_timeout_s: float = 0.02,
-    embed_delay_s: float = 0.002,
-    forward_delay_s: float = 0.005,
     shutdown_after_s: float | None = None,
     seed: int = 0,
 ) -> dict[str, Any]:
     random.seed(seed)
+    model_lock = threading.Lock()  # serializes tinygrad calls; model shared read-only weights
     cache = LRUEmbeddingCache(capacity=cache_capacity, mode=cache_mode)
     queue = DynamicBatchQueue[Request](capacity=queue_capacity)
-    router = Router(cache=cache, queue=queue, embed_delay_s=embed_delay_s)
-    pool = InferenceWorkerPool(queue, num_workers=num_workers, max_batch_size=max_batch_size, batch_timeout_s=batch_timeout_s, process_delay_s=forward_delay_s)
+    router = Router(cache=cache, queue=queue, model=model, model_lock=model_lock)
+    pool = InferenceWorkerPool(queue, model=model, num_workers=num_workers, max_batch_size=max_batch_size, batch_timeout_s=batch_timeout_s, model_lock=model_lock)
     pool.start()
 
-    prompts = [f"prompt-{i}" for i in range(40)]  # mixed hit/miss; repeated
+    prompts = [f"prompt-{i} cache batch router latency {i % 5}" for i in range(40)]
     req_counter = iter(range(num_clients * requests_per_client + 1000))
     start_barrier = threading.Barrier(num_clients)
     t0 = time.perf_counter()
 
-    stop_event = threading.Event()
     if shutdown_after_s is not None:
         def _shutdown_trigger():
             time.sleep(shutdown_after_s)
             queue.shutdown()
-            stop_event.set()
         threading.Thread(target=_shutdown_trigger, daemon=True, name="shutdown-trigger").start()
 
     def client(cid: int):
@@ -213,11 +263,10 @@ def run_pipeline(
             return
         for _ in range(requests_per_client):
             rid = next(req_counter)
-            # Bursty arrivals: occasional pause
             if rng.random() < 0.15:
                 time.sleep(rng.uniform(0.0, 0.01))
             prompt = rng.choice(prompts[:20]) if rng.random() < 0.7 else rng.choice(prompts)
-            req = Request(request_id=rid, prompt=prompt, submitted_at=time.perf_counter(), done=threading.Event())
+            req = Request(request_id=rid, prompt=prompt, embedding=None, submitted_at=time.perf_counter(), done=threading.Event())
             router.handle(req)
             time.sleep(rng.uniform(0.0, 0.003))
 
@@ -227,9 +276,8 @@ def run_pipeline(
     for t in threads:
         t.join()
 
-    # Drain: shutdown if not already
     queue.shutdown()
-    pool.join(timeout=10)
+    pool.join(timeout=30)
     elapsed = time.perf_counter() - t0
 
     cache_stats = cache.snapshot_stats()
@@ -239,7 +287,7 @@ def run_pipeline(
     pool_stats = pool.stats()
     ok_integrity, integrity_msg = cache.verify_integrity()
 
-    result = {
+    return {
         "config": {
             "num_clients": num_clients,
             "requests_per_client": requests_per_client,
@@ -249,9 +297,8 @@ def run_pipeline(
             "num_workers": num_workers,
             "max_batch_size": max_batch_size,
             "batch_timeout_s": batch_timeout_s,
-            "embed_delay_s": embed_delay_s,
-            "forward_delay_s": forward_delay_s,
             "shutdown_after_s": shutdown_after_s,
+            "model": str(Path('artifacts/tiny_embed_classifier.npz')),
         },
         "elapsed_s": elapsed,
         "throughput_rps": (router_stats["completed"] / elapsed) if elapsed else 0.0,
@@ -265,34 +312,28 @@ def run_pipeline(
             "no_deadlock_join": all(not t.is_alive() for t in threads),
         },
     }
-    return result
 
 
-def benchmark() -> dict[str, Any]:
-    # Keep runtimes reasonable while showing trade-offs
+def benchmark(model: LoadedModel) -> dict[str, Any]:
     base = dict(
-        num_clients=30,
-        requests_per_client=25,
+        model=model,
+        num_clients=20,
+        requests_per_client=10,
         cache_capacity=32,
         queue_capacity=128,
-        num_workers=4,
-        embed_delay_s=0.003,
-        forward_delay_s=0.006,
+        num_workers=2,
         seed=1,
     )
-
     configs = [
-        ("coarse_unbatched", {**base, "cache_mode": "coarse", "max_batch_size": 1, "batch_timeout_s": 0.005}),
+        ("coarse_unbatched", {**base, "cache_mode": "coarse", "max_batch_size": 1, "batch_timeout_s": 0.01}),
         ("coarse_batched",   {**base, "cache_mode": "coarse", "max_batch_size": 8, "batch_timeout_s": 0.02}),
-        ("scoped_unbatched", {**base, "cache_mode": "scoped", "max_batch_size": 1, "batch_timeout_s": 0.005}),
+        ("scoped_unbatched", {**base, "cache_mode": "scoped", "max_batch_size": 1, "batch_timeout_s": 0.01}),
         ("scoped_batched",   {**base, "cache_mode": "scoped", "max_batch_size": 8, "batch_timeout_s": 0.02}),
     ]
-
     results = {}
     for name, cfg in configs:
         print(f"Running {name}...", flush=True)
-        res = run_pipeline(**cfg)
-        results[name] = res
+        results[name] = run_pipeline(**cfg)
     return results
 
 
@@ -324,10 +365,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["stress", "benchmark"], default="stress")
     args = parser.parse_args()
+    model = load_saved_model()
     if args.mode == "stress":
-        res = run_pipeline(num_clients=30, requests_per_client=20, cache_mode="scoped", max_batch_size=8, batch_timeout_s=0.02, shutdown_after_s=0.5, seed=2)
+        res = run_pipeline(model=model, num_clients=30, requests_per_client=10, cache_mode="scoped", max_batch_size=8, batch_timeout_s=0.02, shutdown_after_s=0.5, seed=2)
         print(json.dumps(res, indent=2))
     else:
-        res = benchmark()
+        res = benchmark(model)
         print(format_comparison_table(res))
-        print("\nRaw JSON saved to stdout not shown; use programmatic call for full data.")
+        Path("benchmark_results.json").write_text(json.dumps(res, indent=2))
+        print("\nSaved benchmark_results.json")

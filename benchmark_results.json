@@ -1,49 +1,48 @@
 {
   "coarse_unbatched": {
     "config": {
-      "num_clients": 30,
-      "requests_per_client": 25,
+      "num_clients": 20,
+      "requests_per_client": 10,
       "cache_capacity": 32,
       "cache_mode": "coarse",
       "queue_capacity": 128,
-      "num_workers": 4,
+      "num_workers": 2,
       "max_batch_size": 1,
-      "batch_timeout_s": 0.005,
-      "embed_delay_s": 0.003,
-      "forward_delay_s": 0.006,
-      "shutdown_after_s": null
+      "batch_timeout_s": 0.01,
+      "shutdown_after_s": null,
+      "model": "artifacts/tiny_embed_classifier.npz"
     },
-    "elapsed_s": 1.1909853200004363,
-    "throughput_rps": 629.7306838338908,
+    "elapsed_s": 10.152249496999957,
+    "throughput_rps": 19.700067463777465,
     "router": {
-      "total_requests": 750,
-      "accepted": 750,
-      "completed": 750,
+      "total_requests": 200,
+      "accepted": 200,
+      "completed": 200,
       "rejected_on_shutdown": 0,
       "errors": 0,
-      "avg_latency_ms": 44.07632171466685,
-      "p95_latency_ms": 46.93374500038772
+      "avg_latency_ms": 973.2209603450065,
+      "p95_latency_ms": 1956.3754890000382
     },
     "cache": {
-      "hits": 682,
-      "misses": 68,
-      "evictions": 36,
+      "hits": 162,
+      "misses": 38,
+      "evictions": 6,
       "size": 32,
       "capacity": 32,
-      "hit_rate": 0.9093333333333333
+      "hit_rate": 0.81
     },
     "queue": {
       "size": 0,
       "capacity": 128,
       "shutdown": true,
-      "total_enqueued": 750,
-      "total_dequeued": 750,
+      "total_enqueued": 200,
+      "total_dequeued": 200,
       "rejected_on_shutdown": 0
     },
     "worker": {
-      "batches_processed": 750,
-      "total_batch_items": 750,
-      "total_forward_calls": 750,
+      "batches_processed": 200,
+      "total_batch_items": 200,
+      "total_forward_calls": 200,
       "avg_batch_size": 1.0,
       "avg_batch_utilization": 1.0
     },
@@ -58,51 +57,50 @@
   },
   "coarse_batched": {
     "config": {
-      "num_clients": 30,
-      "requests_per_client": 25,
+      "num_clients": 20,
+      "requests_per_client": 10,
       "cache_capacity": 32,
       "cache_mode": "coarse",
       "queue_capacity": 128,
-      "num_workers": 4,
+      "num_workers": 2,
       "max_batch_size": 8,
       "batch_timeout_s": 0.02,
-      "embed_delay_s": 0.003,
-      "forward_delay_s": 0.006,
-      "shutdown_after_s": null
+      "shutdown_after_s": null,
+      "model": "artifacts/tiny_embed_classifier.npz"
     },
-    "elapsed_s": 0.42376995399990847,
-    "throughput_rps": 1769.8281648353059,
+    "elapsed_s": 9.553918522000004,
+    "throughput_rps": 20.93381888692644,
     "router": {
-      "total_requests": 750,
-      "accepted": 750,
-      "completed": 750,
+      "total_requests": 200,
+      "accepted": 200,
+      "completed": 200,
       "rejected_on_shutdown": 0,
       "errors": 0,
-      "avg_latency_ms": 12.266297693353408,
-      "p95_latency_ms": 34.89809399980004
+      "avg_latency_ms": 907.851351125006,
+      "p95_latency_ms": 1862.0029490000434
     },
     "cache": {
-      "hits": 684,
-      "misses": 66,
-      "evictions": 34,
+      "hits": 163,
+      "misses": 37,
+      "evictions": 5,
       "size": 32,
       "capacity": 32,
-      "hit_rate": 0.912
+      "hit_rate": 0.815
     },
     "queue": {
       "size": 0,
       "capacity": 128,
       "shutdown": true,
-      "total_enqueued": 750,
-      "total_dequeued": 750,
+      "total_enqueued": 200,
+      "total_dequeued": 200,
       "rejected_on_shutdown": 0
     },
     "worker": {
-      "batches_processed": 97,
-      "total_batch_items": 750,
-      "total_forward_calls": 97,
-      "avg_batch_size": 7.731958762886598,
-      "avg_batch_utilization": 0.9664948453608248
+      "batches_processed": 62,
+      "total_batch_items": 200,
+      "total_forward_calls": 62,
+      "avg_batch_size": 3.225806451612903,
+      "avg_batch_utilization": 0.4032258064516129
     },
     "integrity": {
       "ok": true,
@@ -115,49 +113,48 @@
   },
   "scoped_unbatched": {
     "config": {
-      "num_clients": 30,
-      "requests_per_client": 25,
+      "num_clients": 20,
+      "requests_per_client": 10,
       "cache_capacity": 32,
       "cache_mode": "scoped",
       "queue_capacity": 128,
-      "num_workers": 4,
+      "num_workers": 2,
       "max_batch_size": 1,
-      "batch_timeout_s": 0.005,
-      "embed_delay_s": 0.003,
-      "forward_delay_s": 0.006,
-      "shutdown_after_s": null
+      "batch_timeout_s": 0.01,
+      "shutdown_after_s": null,
+      "model": "artifacts/tiny_embed_classifier.npz"
     },
-    "elapsed_s": 1.177500904000226,
-    "throughput_rps": 636.9421861606113,
+    "elapsed_s": 9.68239971900016,
+    "throughput_rps": 20.65603629310325,
     "router": {
-      "total_requests": 750,
-      "accepted": 750,
-      "completed": 750,
+      "total_requests": 200,
+      "accepted": 200,
+      "completed": 200,
       "rejected_on_shutdown": 0,
       "errors": 0,
-      "avg_latency_ms": 43.34772486532287,
-      "p95_latency_ms": 47.857829999884416
+      "avg_latency_ms": 927.2838455550004,
+      "p95_latency_ms": 2290.292032999787
     },
     "cache": {
-      "hits": 679,
-      "misses": 71,
-      "evictions": 39,
+      "hits": 163,
+      "misses": 37,
+      "evictions": 5,
       "size": 32,
       "capacity": 32,
-      "hit_rate": 0.9053333333333333
+      "hit_rate": 0.815
     },
     "queue": {
       "size": 0,
       "capacity": 128,
       "shutdown": true,
-      "total_enqueued": 750,
-      "total_dequeued": 750,
+      "total_enqueued": 200,
+      "total_dequeued": 200,
       "rejected_on_shutdown": 0
     },
     "worker": {
-      "batches_processed": 750,
-      "total_batch_items": 750,
-      "total_forward_calls": 750,
+      "batches_processed": 200,
+      "total_batch_items": 200,
+      "total_forward_calls": 200,
       "avg_batch_size": 1.0,
       "avg_batch_utilization": 1.0
     },
@@ -172,51 +169,50 @@
   },
   "scoped_batched": {
     "config": {
-      "num_clients": 30,
-      "requests_per_client": 25,
+      "num_clients": 20,
+      "requests_per_client": 10,
       "cache_capacity": 32,
       "cache_mode": "scoped",
       "queue_capacity": 128,
-      "num_workers": 4,
+      "num_workers": 2,
       "max_batch_size": 8,
       "batch_timeout_s": 0.02,
-      "embed_delay_s": 0.003,
-      "forward_delay_s": 0.006,
-      "shutdown_after_s": null
+      "shutdown_after_s": null,
+      "model": "artifacts/tiny_embed_classifier.npz"
     },
-    "elapsed_s": 0.3073960729998362,
-    "throughput_rps": 2439.8489957300126,
+    "elapsed_s": 8.924591098000064,
+    "throughput_rps": 22.40999030698656,
     "router": {
-      "total_requests": 750,
-      "accepted": 750,
-      "completed": 750,
+      "total_requests": 200,
+      "accepted": 200,
+      "completed": 200,
       "rejected_on_shutdown": 0,
       "errors": 0,
-      "avg_latency_ms": 7.681658435965801,
-      "p95_latency_ms": 10.265359000186436
+      "avg_latency_ms": 833.2376023050188,
+      "p95_latency_ms": 1850.2028249999967
     },
     "cache": {
-      "hits": 688,
-      "misses": 62,
-      "evictions": 30,
+      "hits": 164,
+      "misses": 36,
+      "evictions": 4,
       "size": 32,
       "capacity": 32,
-      "hit_rate": 0.9173333333333333
+      "hit_rate": 0.82
     },
     "queue": {
       "size": 0,
       "capacity": 128,
       "shutdown": true,
-      "total_enqueued": 750,
-      "total_dequeued": 750,
+      "total_enqueued": 200,
+      "total_dequeued": 200,
       "rejected_on_shutdown": 0
     },
     "worker": {
-      "batches_processed": 95,
-      "total_batch_items": 750,
-      "total_forward_calls": 95,
-      "avg_batch_size": 7.894736842105263,
-      "avg_batch_utilization": 0.9868421052631579
+      "batches_processed": 30,
+      "total_batch_items": 200,
+      "total_forward_calls": 30,
+      "avg_batch_size": 6.666666666666667,
+      "avg_batch_utilization": 0.8333333333333334
     },
     "integrity": {
       "ok": true,

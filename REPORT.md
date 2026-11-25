@@ -5,18 +5,22 @@
 - `task1_baseline.py` - intentionally broken baseline router + reproducible stress script.
 - `task2_lru_cache.py` - thread-safe LRU embedding cache built from scratch (coarse/scoped modes).
 - `task3_batch_queue.py` - bounded dynamic batching queue with `Lock`/`Condition`.
-- `task4_pipeline.py` - integrated pipeline, stress test, and benchmark comparisons.
+- `task4_pipeline.py` - integrated pipeline, stress test, and benchmark comparisons; loads saved tinygrad model.
+- `ml_model.py` - tinygrad model/tokenizer, save/load, embedding + batched inference helpers.
+- `train_model.py` - trains and saves the tinygrad model to `artifacts/` (separate from benchmarks).
+- `artifacts/tiny_embed_classifier.npz`, `artifacts/tiny_embed_classifier.json`, `artifacts/train_metrics.json` - saved model/metadata.
 - `test_task2.py`, `test_task3.py` - correctness/stress checks for Task 2 and Task 3.
 - `benchmark_results.json` - raw benchmark output.
 
 ## How to run
 
 ```bash
-python3 task1_baseline.py          # Task 1 reproducible stress + bug summary
-python3 test_task2.py              # Task 2 LRU correctness/stress
-python3 test_task3.py              # Task 3 queue correctness/stress
-python3 task4_pipeline.py --mode stress      # Task 4 reliability stress (30 clients, mid-run shutdown)
-python3 task4_pipeline.py --mode benchmark   # Task 4 benchmark comparison table
+DEV=PYTHON .venv/bin/python train_model.py        # Train & save tinygrad model (separate script)
+python3 task1_baseline.py                         # Task 1 reproducible stress + bug summary
+python3 test_task2.py                             # Task 2 LRU correctness/stress
+python3 test_task3.py                             # Task 3 queue correctness/stress
+DEV=PYTHON .venv/bin/python task4_pipeline.py --mode stress     # Task 4 stress; loads saved model
+DEV=PYTHON .venv/bin/python task4_pipeline.py --mode benchmark  # Task 4 benchmark; loads saved model
 ```
 
 ## Task 1: Broken baseline - observed bugs
@@ -66,60 +70,68 @@ Implementation: `task3_batch_queue.py`.
 - **No busy-waiting**: all waiting uses `Condition.wait()`/`wait(timeout=remaining)`.
 - **Tests**: `test_task3.py` stress run with 10 producers × 200 items, 4 consumers, capacity 16; result `produced == consumed == 2000`, no errors, all consumers exited cleanly.
 
+## ML model (tinygrad)
+
+- **Training script**: `train_model.py` (separate). It builds a tiny synthetic prompt-classification dataset, trains a small tinygrad model, and saves it to `artifacts/`.
+- **Model**: `TinyEmbedClassifier` in `ml_model.py` — token IDs (`nn.Embedding`) -> mean pool -> linear logits (`nn.Linear`). This is intentionally simple and gives a real **embedding stage** that benefits from caching.
+- **Saved artifacts**: `artifacts/tiny_embed_classifier.npz`, `tiny_embed_classifier.json`, `train_metrics.json`. Benchmarks/stress tests load these via `load_model()` and **do not retrain**.
+- **Inference path**: `embed_prompt()` computes prompt embedding with tinygrad; `Router` caches embeddings in the Task 2 LRU cache (`get_or_compute`); workers run batched `logits_from_embedding(Tensor(batch_embs))` for real forward passes.
+- **Runtime note**: tinygrad runs with `DEV=PYTHON` in this environment for portability. A `model_lock` serializes tinygrad calls because the runtime/model state is shared; this lock is never held with cache/queue locks.
+
 ## Task 4: Integrated pipeline, stress test, and benchmarks
 
 Implementation: `task4_pipeline.py`.
 
 ### Pipeline
 
-`Client Threads -> Router -> Thread-Safe LRU Cache -> DynamicBatchQueue -> Inference Worker Pool`
+`Client Threads -> Router -> Thread-Safe LRU Cache (embeddings) -> DynamicBatchQueue -> Inference Worker Pool`
 
-- Router uses `cache.get_or_compute()` for embedding; scoped mode releases cache lock during simulated embed.
-- Accepted requests are enqueued to `DynamicBatchQueue`; workers pull batches via `get_batch(max_batch_size, timeout_s)` and run simulated batched forward pass outside locks.
+- Router uses `cache.get_or_compute(prompt, embed_fn)`; on miss it computes a real tinygrad embedding. Scoped mode releases cache lock during embedding compute (stampede protected by in-flight placeholder).
+- Accepted requests carry cached embedding to `DynamicBatchQueue`; workers pull batches and run a real batched tinygrad forward pass (`logits_from_embedding`) outside cache/queue locks.
 - Request completion is signaled by per-request `threading.Event`.
 
 ### Lock hierarchy / deadlock prevention
 
 1. **Router stats lock** (`Router._stats_lock`) - short-lived counters/latency list only.
-2. **Cache lock** (inside `LRUEmbeddingCache`) - only for fast map/list/in-flight mutations; never held during embed/forward.
+2. **Cache lock** (inside `LRUEmbeddingCache`) - only fast map/list/in-flight mutations; never held during model inference.
 3. **Queue condition lock** (inside `DynamicBatchQueue`) - guards bounded buffer and condition waits.
+4. **Model inference lock** (`pipeline._model_lock`) - serializes tinygrad embed/forward calls; never held together with cache or queue locks.
 
 Rules enforced:
-- Cache and queue locks are **disjoint**; router never holds them simultaneously.
-- No lock is held during simulated `embed()` or batched forward pass.
+- Cache and queue locks are disjoint; router never holds them simultaneously.
+- No cache/queue lock is held during tinygrad embedding or batched forward pass.
 - Condition waits use `while` loops and monotonic deadlines.
 
 ### Stress test reliability
 
-Stress command: `python3 task4_pipeline.py --mode stress` (30 clients, 20 req/client, scoped cache, max_batch=8, timeout=0.02s, mid-run shutdown after 0.3s).
+Command: `DEV=PYTHON .venv/bin/python task4_pipeline.py --mode stress` (loads saved model; 30 clients × 10 req, scoped cache, max_batch=8, shutdown_after_s=0.5).
 
-Observed:
+Observed (real tinygrad inference, saved model):
 
-- `accepted == completed + rejected_on_shutdown`: `300 == 300 + 0` (True)
-- `integrity.ok`: True
-- `no_deadlock_join`: True
-- `errors`: 0
-- Throughput: ~2505 req/s (small simulated delays, local run)
+- `accepted == completed + rejected_on_shutdown`: `300 == 9 + 291` (`True`) — mid-run shutdown correctly rejects un-enqueued requests.
+- `integrity.ok`: `True`
+- `no_deadlock_join`: `True`
+- `errors`: `0`; queue drained cleanly (`enqueued==dequeued==9`).
 
-The pipeline also supports mid-run shutdown; requests not yet enqueued are rejected with `ShutdownError` and counted as `rejected_on_shutdown`.
+The high rejection count is due slow `DEV=PYTHON` tinygrad inference relative to the 0.5s shutdown window; it confirms shutdown accounting and no lost requests.
 
 ### Benchmark comparison
 
-Command: `python3 task4_pipeline.py --mode benchmark` (30 clients, 25 req/client, cache cap 32, queue cap 128, 4 workers, embed 3ms, forward 6ms, seed 1).
+Command: `DEV=PYTHON .venv/bin/python task4_pipeline.py --mode benchmark` (20 clients × 10 req, cache cap 32, queue cap 128, 2 workers, saved model loaded once).
 
 | config | rps | avg_ms | p95_ms | hit_rate | avg_batch | batch_util | accepted==comp+rej | integrity |
 |---|---:|---:|---:|---:|---:|---:|:---:|:---:|
-| coarse_unbatched | 629.73 | 44.08 | 46.93 | 0.909 | 1.00 | 1.000 | True | True |
-| coarse_batched | 1769.83 | 12.27 | 34.90 | 0.912 | 7.73 | 0.966 | True | True |
-| scoped_unbatched | 636.94 | 43.35 | 47.86 | 0.905 | 1.00 | 1.000 | True | True |
-| scoped_batched | 2439.85 | 7.68 | 10.27 | 0.917 | 7.89 | 0.987 | True | True |
+| coarse_unbatched | 19.70 | 973.22 | 1956.38 | 0.810 | 1.00 | 1.000 | True | True |
+| coarse_batched | 20.93 | 907.85 | 1862.00 | 0.815 | 3.23 | 0.403 | True | True |
+| scoped_unbatched | 20.66 | 927.28 | 2290.29 | 0.815 | 1.00 | 1.000 | True | True |
+| scoped_batched | 22.41 | 833.24 | 1850.20 | 0.820 | 6.67 | 0.833 | True | True |
 
 ### Why the numbers behave this way
 
-- **Batching dominates throughput**: unbatched (`max_batch_size=1`) pays one 6ms forward delay per request; batched (`max_batch_size=8`) amortizes that forward delay across ~7.6-7.8 requests, giving ~2.7x-3.6x higher throughput.
-- **Scoped locking helps most when batching is enabled**: in unbatched mode, workers mostly serialize on per-request forward passes, so coarse vs scoped cache lock contention is less visible. In batched mode, the pipeline can drive more concurrent cache lookups/embeds; scoped locking avoids holding the cache lock during the 3ms embed, reducing contention and improving both throughput and tail latency.
-- **Tail latency improves with scoped+batching**: coarse_batched has better average than unbatched but still high p95 (38.25ms) because coarse lock blocks cache access during embeds. scoped_batched has the best p95 (10.69ms) because cache mutations are short and embed work runs outside the lock.
-- **Cache hit rate is stable** (~0.90-0.92) because all configs use the same key distribution/capacity; differences are minor run-to-run effects, not structural.
+- **Real inference is the bottleneck**: with `DEV=PYTHON`, tinygrad embedding/forward calls are much slower than the old `time.sleep()` simulation, so throughput is lower and latency higher. This is expected for a portability backend.
+- **Batching still helps**: `scoped_batched` has the best throughput and lowest average/p95 because batched forward passes amortize per-request overhead; average batch size/utilization rises to 6.67/0.833.
+- **Scoped vs coarse**: scoped mode releases cache lock during embedding compute. The gain is modest here because the global `model_lock` serializes tinygrad execution, but scoped still avoids holding cache lock across inference and gives the best batched result.
+- **Cache hit rate** remains ~0.81-0.82 across configs with same key distribution/capacity, confirming the LRU cache is reused effectively.
 
 ## Notes / constraints compliance
 
