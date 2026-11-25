@@ -1,0 +1,7 @@
+{
+  "vocab_size": 128,
+  "embed_dim": 32,
+  "num_classes": 8,
+  "max_len": 16,
+  "weights": "tiny_embed_classifier.npz"
+}
